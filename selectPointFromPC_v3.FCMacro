@@ -1,0 +1,381 @@
+def selectPointFromPC():
+
+    import FreeCAD as App
+    import FreeCADGui as Gui
+    import pivy.coin as coin
+    import numpy as np
+
+
+    # =========================================================
+    # Chargement du nuage
+    # =========================================================
+
+    sel = Gui.Selection.getSelection()
+
+    if not sel:
+        raise Exception("Sélectionnez un Points::Feature.")
+
+    cloud = sel[0]
+
+    pts = cloud.Points.Points
+
+    points = np.array(
+        [(p.x, p.y, p.z) for p in pts],
+        dtype=float
+    )
+
+    print(len(points), "points chargés")
+
+
+    # =========================================================
+    # Octree
+    # =========================================================
+
+    class Octree:
+
+        def __init__(self, points, indices, depth=0,
+                     max_points=50, max_depth=12):
+
+            self.points = points
+            self.indices = indices
+            self.children = []
+
+            self.min = points[indices].min(axis=0)
+            self.max = points[indices].max(axis=0)
+
+            self.center = (self.min + self.max) * 0.5
+
+
+            if len(indices) <= max_points or depth >= max_depth:
+                return
+
+
+            for x in [0,1]:
+                for y in [0,1]:
+                    for z in [0,1]:
+
+                        mask = np.ones(len(indices), dtype=bool)
+
+                        for i,b in enumerate([x,y,z]):
+
+                            if b:
+                                mask &= (
+                                    points[indices,i] >= self.center[i]
+                                )
+                            else:
+                                mask &= (
+                                    points[indices,i] < self.center[i]
+                                )
+
+
+                        child_idx = indices[mask]
+
+
+                        if len(child_idx):
+
+                            self.children.append(
+                                Octree(
+                                    points,
+                                    child_idx,
+                                    depth+1,
+                                    max_points,
+                                    max_depth
+                                )
+                            )
+
+
+        def distance_ray_box(self,O,D):
+
+            invD = np.divide(
+                1.0,
+                D,
+                out=np.full_like(D,np.inf),
+                where=D!=0
+            )
+
+            t1 = (self.min-O)*invD
+            t2 = (self.max-O)*invD
+
+            tmin = np.max(
+                np.minimum(t1,t2)
+            )
+
+            tmax = np.min(
+                np.maximum(t1,t2)
+            )
+
+            return tmax >= max(tmin,0)
+
+
+
+        def search_ray(self,O,D,best):
+
+            if not self.distance_ray_box(O,D):
+                return best
+
+
+            if self.children:
+
+                for child in self.children:
+
+                    best = child.search_ray(
+                        O,
+                        D,
+                        best
+                    )
+
+
+            else:
+
+                for i in self.indices:
+
+                    P = self.points[i]
+
+                    d = np.linalg.norm(
+                        np.cross(P-O,D)
+                    )
+
+                    if d < best[0]:
+
+                        best = (d,i)
+
+
+            return best
+
+
+
+    print("Construction octree...")
+
+    octree = Octree(
+        points,
+        np.arange(len(points))
+    )
+
+    print("Octree terminé")
+
+
+
+    # =========================================================
+    # Marqueur jaune
+    # =========================================================
+
+    view = Gui.ActiveDocument.ActiveView
+    root = view.getSceneGraph()
+
+
+    sep = coin.SoSeparator()
+
+    # visible au départ
+    sep.whichChild = -3
+
+
+    mat = coin.SoMaterial()
+    mat.diffuseColor.setValue(
+        1.0,
+        1.0,
+        0.0
+    )
+    
+    # Transparence : 0.0 = opaque, 1.0 = invisible
+    mat.transparency = 0.7
+    
+    # Suppression des reflets spéculaires
+    mat.specularColor.setValue(
+        0.0,
+        0.0,
+        0.0
+    )
+    
+    # Pas de brillance
+    mat.shininess = 0.0
+
+
+    translation = coin.SoTranslation()
+
+
+    sphere = coin.SoSphere()
+    sphere.radius = 0.1
+
+    lightModel = coin.SoLightModel()
+    lightModel.model = coin.SoLightModel.BASE_COLOR
+    
+    sep.addChild(lightModel)
+    sep.addChild(mat)
+    sep.addChild(translation)
+    sep.addChild(sphere)
+
+
+    root.addChild(sep)
+
+
+    running = True
+
+
+
+    # =========================================================
+    # Rayon caméra
+    # =========================================================
+
+    def get_ray(x,y):
+
+        cam = view.getCameraNode()
+
+        pos = cam.position.getValue()
+
+        O = np.array([
+            pos[0],
+            pos[1],
+            pos[2]
+        ])
+
+
+        p = view.getPoint(x,y)
+
+        P = np.array([
+            p.x,
+            p.y,
+            p.z
+        ])
+
+
+        D = P-O
+
+        n = np.linalg.norm(D)
+
+        if n == 0:
+            return None,None
+
+        D /= n
+
+        return O,D
+
+
+
+    # =========================================================
+    # Callback
+    # =========================================================
+
+    def callback(event):
+
+        nonlocal running
+
+
+        if not running:
+            return
+
+
+
+        # -----------------------------
+        # Mouvement souris
+        # -----------------------------
+
+        if event["Type"] == "SoLocation2Event":
+
+            x,y = event["Position"]
+
+            O,D = get_ray(x,y)
+
+            if O is None:
+                return
+
+
+            dist,idx = octree.search_ray(
+                O,
+                D,
+                (float("inf"),None)
+            )
+
+
+            if idx is not None:
+
+                p = points[idx]
+
+                translation.translation.setValue(
+                    float(p[0]),
+                    float(p[1]),
+                    float(p[2])
+                )
+
+
+
+        # -----------------------------
+        # Clic gauche
+        # -----------------------------
+
+        elif event["Type"] == "SoMouseButtonEvent":
+
+            if (
+                event["Button"] == "BUTTON1"
+                and event["State"] == "DOWN"
+            ):
+
+                x,y = event["Position"]
+
+                O,D = get_ray(x,y)
+
+                if O is None:
+                    return
+
+
+                dist,idx = octree.search_ray(
+                    O,
+                    D,
+                    (float("inf"),None)
+                )
+
+
+                if idx is not None:
+
+                    p = points[idx]
+
+                    print("----------------")
+                    print("Point sélectionné")
+                    print("X =",p[0])
+                    print("Y =",p[1])
+                    print("Z =",p[2])
+                    print("Distance rayon =",dist)
+
+
+
+        # -----------------------------
+        # ESC
+        # -----------------------------
+
+        elif event["Type"] == "SoKeyboardEvent":
+
+            if event["Key"] == "ESCAPE":
+
+                running = False
+
+
+                view.removeEventCallback(
+                    "SoEvent",
+                    callback
+                )
+
+
+                sep.whichChild = -1
+
+
+                print("Aimantation octree arrêtée")
+
+
+
+    # =========================================================
+    # Activation
+    # =========================================================
+
+    view.addEventCallback(
+        "SoEvent",
+        callback
+    )
+
+
+    print()
+    print("Aimantation octree active")
+    print("ESC : arrêter")
+    print("Clic gauche : coordonnées")
+
+
+
+selectPointFromPC()
